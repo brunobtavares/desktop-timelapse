@@ -1,13 +1,18 @@
 import ctypes
 import msvcrt
 import time
-from pathlib import Path
 from ctypes import wintypes
+from dataclasses import dataclass
+from pathlib import Path
 
 import mss
+import mss.tools
 
 
+DEFAULT_OUTPUT_DIR = "timelapse_frames"
 MONITORINFOF_PRIMARY = 1
+PAUSE_KEY = "p"
+KEYBOARD_POLL_INTERVAL_SECONDS = 0.1
 
 
 class MONITORINFO(ctypes.Structure):
@@ -19,43 +24,76 @@ class MONITORINFO(ctypes.Structure):
     ]
 
 
-def tecla_pressionada() -> str | None:
+@dataclass(frozen=True)
+class ScreenRegion:
+    left: int
+    top: int
+    width: int
+    height: int
+
+    @classmethod
+    def from_mss_monitor(cls, monitor: dict[str, int]) -> "ScreenRegion":
+        return cls(
+            left=monitor["left"],
+            top=monitor["top"],
+            width=monitor["width"],
+            height=monitor["height"],
+        )
+
+    @property
+    def key(self) -> tuple[int, int, int, int]:
+        return (self.left, self.top, self.width, self.height)
+
+    def as_mss_monitor(self) -> dict[str, int]:
+        return {
+            "left": self.left,
+            "top": self.top,
+            "width": self.width,
+            "height": self.height,
+        }
+
+    def describe(self) -> str:
+        return f"{self.width}x{self.height} em ({self.left}, {self.top})"
+
+
+@dataclass(frozen=True)
+class MonitorOption:
+    index: int
+    region: ScreenRegion
+    is_primary: bool = False
+
+    def describe(self) -> str:
+        suffix = " (principal)" if self.is_primary else ""
+        return f"{self.index}: {self.region.describe()}{suffix}"
+
+
+def read_pressed_key() -> str | None:
     if not msvcrt.kbhit():
         return None
 
-    tecla = msvcrt.getwch()
-    if tecla in ("\x00", "\xe0") and msvcrt.kbhit():
+    key = msvcrt.getwch()
+    if key in ("\x00", "\xe0") and msvcrt.kbhit():
         msvcrt.getwch()
         return None
 
-    return tecla.lower()
+    return key.lower()
 
 
-def aguardar_com_controle(intervalo_segundos: float) -> bool:
-    fim_espera = time.monotonic() + intervalo_segundos
+def wait_with_pause_control(interval_seconds: float) -> bool:
+    deadline = time.monotonic() + interval_seconds
 
-    while time.monotonic() < fim_espera:
-        tecla = tecla_pressionada()
-        if tecla == "p":
+    while time.monotonic() < deadline:
+        if read_pressed_key() == PAUSE_KEY:
             return True
 
-        time.sleep(0.1)
+        time.sleep(KEYBOARD_POLL_INTERVAL_SECONDS)
 
     return False
 
 
-def monitor_para_chave(monitor: dict) -> tuple[int, int, int, int]:
-    return (
-        monitor["left"],
-        monitor["top"],
-        monitor["width"],
-        monitor["height"],
-    )
-
-
-def obter_chave_monitor_principal() -> tuple[int, int, int, int] | None:
+def get_primary_monitor_key() -> tuple[int, int, int, int] | None:
     user32 = ctypes.windll.user32
-    monitor_principal = None
+    primary_monitor = None
 
     monitor_enum_proc = ctypes.WINFUNCTYPE(
         ctypes.c_int,
@@ -66,12 +104,15 @@ def obter_chave_monitor_principal() -> tuple[int, int, int, int] | None:
     )
 
     def callback(hmonitor, _hdc, _rect, _lparam):
-        nonlocal monitor_principal
+        nonlocal primary_monitor
 
         info = MONITORINFO()
         info.cbSize = ctypes.sizeof(MONITORINFO)
-        if user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)) and info.dwFlags & MONITORINFOF_PRIMARY:
-            monitor_principal = (
+        is_primary = user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)) and (
+            info.dwFlags & MONITORINFOF_PRIMARY
+        )
+        if is_primary:
+            primary_monitor = (
                 info.rcMonitor.left,
                 info.rcMonitor.top,
                 info.rcMonitor.right - info.rcMonitor.left,
@@ -82,117 +123,147 @@ def obter_chave_monitor_principal() -> tuple[int, int, int, int] | None:
         return 1
 
     user32.EnumDisplayMonitors(0, 0, monitor_enum_proc(callback), 0)
-    return monitor_principal
+    return primary_monitor
 
 
-def listar_monitores(sct: mss.mss) -> list[dict]:
-    monitores = []
-    chave_principal = obter_chave_monitor_principal()
+def list_monitors(sct: mss.mss) -> list[MonitorOption]:
+    primary_key = get_primary_monitor_key()
+    monitors: list[MonitorOption] = []
 
-    for indice, monitor in enumerate(sct.monitors[1:], start=1):
-        monitores.append(
-            {
-                "indice": indice,
-                "dados": monitor,
-                "principal": monitor_para_chave(monitor) == chave_principal,
-            }
+    for index, monitor in enumerate(sct.monitors[1:], start=1):
+        region = ScreenRegion.from_mss_monitor(monitor)
+        monitors.append(
+            MonitorOption(
+                index=index,
+                region=region,
+                is_primary=region.key == primary_key,
+            )
         )
 
-    if monitores and not any(monitor["principal"] for monitor in monitores):
-        monitores[0]["principal"] = True
+    if monitors and not any(monitor.is_primary for monitor in monitors):
+        monitors[0] = MonitorOption(
+            index=monitors[0].index,
+            region=monitors[0].region,
+            is_primary=True,
+        )
 
-    return monitores
+    return monitors
 
 
-def selecionar_monitor_interativamente(monitores: list[dict]) -> dict:
-    if not monitores:
+def require_primary_monitor(monitors: list[MonitorOption]) -> ScreenRegion:
+    if not monitors:
         raise RuntimeError("Nenhum monitor individual foi encontrado.")
 
+    for monitor in monitors:
+        if monitor.is_primary:
+            return monitor.region
+
+    raise RuntimeError("Nao foi possivel determinar o monitor principal.")
+
+
+def select_monitor_interactively(monitors: list[MonitorOption]) -> ScreenRegion:
+    default_monitor = require_primary_monitor(monitors)
+
     print("\nMonitores disponiveis:")
-    for monitor in monitores:
-        dados = monitor["dados"]
-        principal = " (principal)" if monitor["principal"] else ""
-        print(
-            f"{monitor['indice']}: {dados['width']}x{dados['height']} "
-            f"em ({dados['left']}, {dados['top']}){principal}"
-        )
+    for monitor in monitors:
+        print(monitor.describe())
 
     while True:
-        escolha = input("Selecione o monitor para gravar [Enter = principal]: ").strip()
-        if not escolha:
-            return next(monitor["dados"] for monitor in monitores if monitor["principal"])
+        choice = input("Selecione o monitor para gravar [Enter = principal]: ").strip()
+        if not choice:
+            return default_monitor
 
-        if escolha.isdigit():
-            indice_escolhido = int(escolha)
-            for monitor in monitores:
-                if monitor["indice"] == indice_escolhido:
-                    return monitor["dados"]
+        if choice.isdigit():
+            selected_index = int(choice)
+            for monitor in monitors:
+                if monitor.index == selected_index:
+                    return monitor.region
 
         print("Monitor invalido. Digite um numero da lista ou pressione Enter para usar o principal.")
 
 
-def capturar_tela(
-    intervalo_segundos: float,
-    pasta_saida: str = "timelapse_frames",
-    monitor_selecionado: dict | None = None,
-):
-    pasta = Path(pasta_saida)
-    pasta.mkdir(parents=True, exist_ok=True)
+def prompt_capture_interval() -> float:
+    while True:
+        raw_value = input("Digite o intervalo entre capturas, em segundos: ").strip()
+        try:
+            interval_seconds = float(raw_value)
+        except ValueError:
+            print("Intervalo invalido. Digite um numero maior que zero.")
+            continue
+
+        if interval_seconds <= 0:
+            print("Intervalo invalido. Digite um numero maior que zero.")
+            continue
+
+        return interval_seconds
+
+
+def prompt_output_dir() -> str:
+    output_dir = input(f"Digite o nome da pasta de saída [{DEFAULT_OUTPUT_DIR}]: ").strip()
+    return output_dir or DEFAULT_OUTPUT_DIR
+
+
+def capture_screen(
+    interval_seconds: float,
+    output_dir: str = DEFAULT_OUTPUT_DIR,
+    selected_monitor: ScreenRegion | None = None,
+) -> None:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
 
     with mss.mss() as sct:
-        if monitor_selecionado is None:
-            monitores = listar_monitores(sct)
-            monitor = next(monitor["dados"] for monitor in monitores if monitor["principal"])
-        else:
-            monitor = monitor_selecionado
+        monitor = selected_monitor
+        if monitor is None:
+            monitor = require_primary_monitor(list_monitors(sct))
 
-        print(f"Salvando prints em: {pasta.resolve()}")
-        print(f"Intervalo: {intervalo_segundos} segundo(s)")
-        print(
-            "Monitor: "
-            f"{monitor['width']}x{monitor['height']} em ({monitor['left']}, {monitor['top']})"
-        )
+        print(f"Salvando prints em: {output_path.resolve()}")
+        print(f"Intervalo: {interval_seconds} segundo(s)")
+        print(f"Monitor: {monitor.describe()}")
         print("Pressione P para pausar/retomar.")
         print("Pressione Ctrl + C para parar.\n")
 
-        contador = 1
-        pausado = False
+        frame_counter = 1
+        paused = False
 
         try:
             while True:
-                if pausado:
-                    tecla = tecla_pressionada()
-                    if tecla == "p":
-                        pausado = False
+                if paused:
+                    if read_pressed_key() == PAUSE_KEY:
+                        paused = False
                         print("Captura retomada.")
                     else:
-                        time.sleep(0.1)
+                        time.sleep(KEYBOARD_POLL_INTERVAL_SECONDS)
                     continue
 
-                nome_arquivo = pasta / f"{contador:06d}.png"
+                output_file = output_path / f"{frame_counter:06d}.png"
+                screenshot = sct.grab(monitor.as_mss_monitor())
+                mss.tools.to_png(screenshot.rgb, screenshot.size, output=str(output_file))
 
-                sct_img = sct.grab(monitor)
-                mss.tools.to_png(sct_img.rgb, sct_img.size, output=str(nome_arquivo))
+                print(f"[{frame_counter:06d}] Capturado: {output_file.name}")
+                frame_counter += 1
 
-                print(f"[{contador:06d}] Capturado: {nome_arquivo.name}")
-                contador += 1
-
-                if aguardar_com_controle(intervalo_segundos):
-                    pausado = True
+                if wait_with_pause_control(interval_seconds):
+                    paused = True
                     print("Captura pausada. Pressione P para retomar.")
 
         except KeyboardInterrupt:
-            print("\nCaptura encerrada pelo usuário.")
+            print("\nCaptura encerrada pelo usuario.")
+
+
+def main() -> int:
+    interval_seconds = prompt_capture_interval()
+    output_dir = prompt_output_dir()
+
+    with mss.mss() as sct:
+        selected_monitor = select_monitor_interactively(list_monitors(sct))
+
+    capture_screen(
+        interval_seconds=interval_seconds,
+        output_dir=output_dir,
+        selected_monitor=selected_monitor,
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    intervalo = float(input("Digite o intervalo entre capturas, em segundos: ").strip())
-    pasta = input("Digite o nome da pasta de saída [timelapse_frames]: ").strip()
-
-    if not pasta:
-        pasta = "timelapse_frames"
-
-    with mss.mss() as sct:
-        monitor = selecionar_monitor_interativamente(listar_monitores(sct))
-
-    capturar_tela(intervalo_segundos=intervalo, pasta_saida=pasta, monitor_selecionado=monitor)
+    raise SystemExit(main())
