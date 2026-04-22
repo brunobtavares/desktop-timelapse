@@ -1,6 +1,6 @@
 # desktop-timelapse
 
-Script simples para capturar screenshots periódicos da tela principal e depois montar um timelapse em vídeo com `ffmpeg`.
+Script simples para capturar screenshots periódicos de um monitor escolhido e depois montar um timelapse em vídeo com `ffmpeg`.
 
 ## Como funciona
 
@@ -8,7 +8,8 @@ O script [`timelapse.py`](/C:/Projetos/desktop-timelapse/timelapse.py) faz o seg
 
 - pede o intervalo entre capturas em segundos;
 - pede o nome da pasta de saída, com padrão `timelapse_frames`;
-- captura a tela principal do Windows continuamente;
+- lista os monitores disponíveis e permite escolher qual será gravado;
+- usa o monitor principal por padrão se nenhuma opção for selecionada;
 - salva as imagens em PNG na pasta informada;
 - nomeia os arquivos em sequência, como `000001.png`, `000002.png`, `000003.png`;
 - permite pausar e retomar a captura com a tecla `P`;
@@ -45,15 +46,23 @@ Exemplo:
 ```text
 Digite o intervalo entre capturas, em segundos: 5
 Digite o nome da pasta de saída [timelapse_frames]:
+Monitores disponiveis:
+1: 1920x1080 em (0, 0) (principal)
+2: 1920x1080 em (1920, 0)
+Selecione o monitor para gravar [Enter = principal]:
 ```
 
-Nesse exemplo, uma imagem será salva a cada 5 segundos na pasta padrão `timelapse_frames`.
+Nesse exemplo, uma imagem será salva a cada 5 segundos na pasta padrão `timelapse_frames`, usando o monitor principal porque o prompt foi deixado em branco.
 
 Se quiser usar outra pasta, basta informar um nome diferente:
 
 ```text
 Digite o intervalo entre capturas, em segundos: 5
 Digite o nome da pasta de saída [timelapse_frames]: reuniao-manha
+Monitores disponiveis:
+1: 1920x1080 em (0, 0) (principal)
+2: 2560x1440 em (-2560, 0)
+Selecione o monitor para gravar [Enter = principal]: 2
 ```
 
 ## Controles durante a captura
@@ -105,6 +114,7 @@ desktop-timelapse/
 
 ## Observações
 
-- O script captura a tela principal.
+- O script permite escolher qual monitor sera gravado.
+- Se voce pressionar `Enter` no prompt de selecao, o script usa o monitor principal.
 - Se você pressionar `Enter` sem informar uma pasta, o script usa `timelapse_frames`.
 - Se você rodar o script novamente, novos arquivos continuarão sendo gravados nessa pasta.
